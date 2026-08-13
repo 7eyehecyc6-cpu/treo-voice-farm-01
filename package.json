@@ -1,10 +1,17 @@
 {
-  "name": "voice-farm-v3",
+  "name": "discord-voice-farm",
   "version": "1.0.0",
+  "description": "Discord Voice Farm in Node.js",
+  "main": "voice_farm.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node voice_farm.js"
   },
   "dependencies": {
-    "discord.js-selfbot-v13": "3.7.1"
+    "express": "^4.19.2",
+    "tweetnacl": "^1.0.3",
+    "ws": "^8.16.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
