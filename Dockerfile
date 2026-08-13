@@ -9,4 +9,4 @@ COPY voice_farm.js .
 
 EXPOSE 8080
 
-CMD ["node", "voice_farm.js"]
+CMD ["node", "index.js"]
