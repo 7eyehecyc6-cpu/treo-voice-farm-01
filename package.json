@@ -1,15 +1,15 @@
 {
-  "name": "discord-voice-farm",
+  "name": "treo-voice-farm-01",
   "version": "1.0.0",
-  "description": "Discord Voice Farm in Node.js",
-  "main": "voice_farm.js",
+  "description": "Discord Voice Farm 24/7 Selfbot",
+  "main": "index.js",
   "scripts": {
-    "start": "node voice_farm.js"
+    "start": "node index.js"
   },
   "dependencies": {
-    "express": "^4.19.2",
-    "tweetnacl": "^1.0.3",
-    "ws": "^8.16.0"
+    "@discordjs/voice": "^0.16.1",
+    "discord.js-selfbot-v13": "^2.15.2",
+    "express": "^4.19.2"
   },
   "engines": {
     "node": ">=18.0.0"
