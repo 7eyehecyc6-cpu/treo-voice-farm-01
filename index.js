@@ -1,142 +1,326 @@
-const { Client } = require('discord.js-selfbot-v13');
-const http = require('http');
-const https = require('https');
+const express = require('express');
+const WebSocket = require('ws');
+const dgram = require('dgram');
+const nacl = require('tweetnacl');
 
 const TOKEN = process.env.DISCORD_TOKEN || '';
 const GUILD_ID = process.env.GUILD_ID || '';
 const CHANNEL_ID = process.env.CHANNEL_ID || '';
 const PORT = process.env.PORT || 8080;
-const APP_URL = process.env.APP_URL || process.env.RENDER_EXTERNAL_URL || '';
 
-if (!TOKEN || !GUILD_ID || !CHANNEL_ID) {
-    console.error('[VOICE] Missing required env vars');
-    process.exit(1);
-}
+const GATEWAY_URL = 'wss://gateway.discord.gg/?v=10&encoding=json';
+const VOICE_GATEWAY_VERSION = 4;
+const FRAME_SIZE_AUDIO = 960;
+const SILENCE_FRAME = Buffer.from([0xf8, 0xff, 0xfe]);
+const SILENCE_INTERVAL = 5000; // milliseconds
 
-const client = new Client({
-    checkUpdate: false,
-    ws: {
-        properties: {
-            $os: 'Windows',
-            $browser: 'Discord Client',
-            $device: 'Desktop',
-            $referrer: '',
-            $referring_domain: ''
+// Express Server cho Render Health Checks
+const app = express();
+app.get('/', (req, res) => res.json({ status: 'alive' }));
+app.get('/health', (req, res) => res.status(200).send('OK'));
+
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`[HTTP] Web server ready on port ${PORT}`);
+});
+
+class VoiceClient {
+  constructor() {
+    this.gwWs = null;
+    this.voiceWs = null;
+    this.udpSock = null;
+    this.ssrc = 0;
+    this.voiceIp = null;
+    this.voicePort = null;
+    this.encryptionKey = null;
+    this.encryptionMode = 'xsalsa20_poly1305';
+    this.seq = 0;
+    this.timestamp = 0;
+    this.sessionId = null;
+    this.sequence = null;
+    this.running = true;
+    this.connected = false;
+    this.reconnectCount = 0;
+    this.gwHbInterval = null;
+    this.voiceHbInterval = null;
+    this.silenceInterval = null;
+  }
+
+  async run() {
+    if (!TOKEN || !GUILD_ID || !CHANNEL_ID) {
+      console.error('[ERROR] Missing environment variables: DISCORD_TOKEN, GUILD_ID, or CHANNEL_ID');
+      return;
+    }
+
+    while (this.running) {
+      try {
+        const ok = await this.connectGateway();
+        if (!ok) {
+          await this.sleep(10000);
+          continue;
         }
-    }
-});
 
-let voiceConnection = null;
-let reconnectTimer = null;
-let reconnectAttempts = 0;
-const MAX_RECONNECT = 50;
-
-async function joinVoice() {
-    try {
-        const guild = client.guilds.cache.get(GUILD_ID);
-        if (!guild) {
-            const fetched = await client.guilds.fetch(GUILD_ID).catch(() => null);
-            if (!fetched) return false;
+        while (this.running && this.connected) {
+          await this.sleep(10000);
         }
-        
-        const g = client.guilds.cache.get(GUILD_ID);
-        const channel = await g.channels.fetch(CHANNEL_ID).catch(() => null);
-        
-        if (!channel || !channel.isVoice()) return false;
 
-        console.log(`[VOICE] Joining: ${g.name} -> ${channel.name}`);
+        if (!this.running) break;
 
-        voiceConnection = await client.voice.joinChannel(channel, {
-            selfDeaf: true,
-            selfMute: false,
-            selfVideo: false
-        });
-
-        reconnectAttempts = 0;
-
-        voiceConnection.on('ready', () => {
-            console.log('[VOICE] ✅ Voice connection READY — 24/7 mode active');
-        });
-
-        voiceConnection.on('disconnect', () => {
-            voiceConnection = null;
-            scheduleReconnect();
-        });
-
-        return true;
-    } catch (e) {
-        console.error(`[VOICE] Join error: ${e.message}`);
-        voiceConnection = null;
-        scheduleReconnect();
-        return false;
+        this.reconnectCount++;
+        const wait = Math.min(5000 * this.reconnectCount, 30000);
+        await this.cleanupVoice();
+        await this.sleep(wait);
+      } catch (err) {
+        console.warn(`[WARN] Client error: ${err.message}`);
+        this.reconnectCount++;
+        const wait = Math.min(5000 * this.reconnectCount, 30000);
+        await this.sleep(wait);
+      }
     }
-}
+  }
 
-function scheduleReconnect() {
-    if (reconnectTimer) clearTimeout(reconnectTimer);
-    reconnectAttempts++;
-    const delay = Math.min(5000 * reconnectAttempts, 30000);
-    if (reconnectAttempts > MAX_RECONNECT) {
-        reconnectAttempts = 0;
-        reconnectTimer = setTimeout(() => joinVoice(), 300000);
+  connectGateway() {
+    return new Promise((resolve) => {
+      this.gwWs = new WebSocket(GATEWAY_URL);
+
+      this.gwWs.on('message', async (data) => {
+        try {
+          const msg = JSON.parse(data.toString());
+          if (msg.s !== undefined) this.sequence = msg.s;
+
+          // OP 10 HELLO
+          if (msg.op === 10) {
+            this.startGwHeartbeat(msg.d.heartbeat_interval);
+
+            this.gwWs.send(JSON.stringify({
+              op: 2,
+              d: {
+                token: TOKEN,
+                properties: { $os: 'linux', $browser: 'voice-farm', $device: 'voice-farm' },
+                compress: false,
+                large_threshold: 50,
+                shard: [0, 1]
+              }
+            }));
+          }
+
+          // READY
+          if (msg.t === 'READY') {
+            this.sessionId = msg.d.session_id;
+            this.gwWs.send(JSON.stringify({
+              op: 4,
+              d: { guild_id: GUILD_ID, channel_id: CHANNEL_ID, self_mute: false, self_deaf: true }
+            }));
+          }
+
+          // VOICE_SERVER_UPDATE
+          if (msg.op === 0 && msg.t === 'VOICE_SERVER_UPDATE') {
+            this.voiceToken = msg.d.token;
+            this.voiceEndpoint = msg.d.endpoint;
+            const connected = await this.connectVoice();
+            resolve(connected);
+          }
+
+          if (msg.op === 9) {
+            resolve(false);
+          }
+        } catch (e) {
+          console.error('[ERROR] Gateway payload error:', e);
+        }
+      });
+
+      this.gwWs.on('error', (err) => {
+        console.error('[ERROR] Gateway WebSocket error:', err.message);
+        resolve(false);
+      });
+
+      this.gwWs.on('close', () => {
+        this.stopGwHeartbeat();
+        this.connected = false;
+      });
+    });
+  }
+
+  startGwHeartbeat(interval) {
+    this.stopGwHeartbeat();
+    this.gwHbInterval = setInterval(() => {
+      if (this.gwWs && this.gwWs.readyState === WebSocket.OPEN) {
+        this.gwWs.send(JSON.stringify({ op: 1, d: this.sequence }));
+      }
+    }, interval);
+  }
+
+  stopGwHeartbeat() {
+    if (this.gwHbInterval) clearInterval(this.gwHbInterval);
+  }
+
+  connectVoice() {
+    return new Promise((resolve) => {
+      if (!this.voiceEndpoint || !this.voiceToken) return resolve(false);
+
+      const vurl = `wss://${this.voiceEndpoint}/?v=${VOICE_GATEWAY_VERSION}`;
+      this.voiceWs = new WebSocket(vurl);
+
+      this.voiceWs.on('message', async (data) => {
+        try {
+          const msg = JSON.parse(data.toString());
+
+          if (msg.op === 8) {
+            this.startVoiceHeartbeat(msg.d.heartbeat_interval);
+            this.voiceWs.send(JSON.stringify({
+              op: 0,
+              d: { server_id: GUILD_ID, user_id: null, session_id: this.voiceToken, token: this.voiceToken }
+            }));
+          }
+
+          if (msg.op === 2) {
+            this.ssrc = msg.d.ssrc;
+            this.voiceIp = msg.d.ip;
+            this.voicePort = msg.d.port;
+
+            if (msg.d.modes.includes('xsalsa20_poly1305')) {
+              this.encryptionMode = 'xsalsa20_poly1305';
+            }
+
+            const udpSuccess = await this.performUdpDiscovery();
+            if (!udpSuccess) return resolve(false);
+          }
+
+          if (msg.op === 4) {
+            this.encryptionKey = Uint8Array.from(msg.d.secret_key);
+            this.connected = true;
+            this.startSilenceLoop();
+            resolve(true);
+          }
+        } catch (e) {
+          console.error('[ERROR] Voice WS message error:', e);
+        }
+      });
+
+      this.voiceWs.on('error', (err) => {
+        console.error('[ERROR] Voice WS Error:', err.message);
+        resolve(false);
+      });
+
+      this.voiceWs.on('close', () => {
+        this.stopVoiceHeartbeat();
+        this.connected = false;
+      });
+    });
+  }
+
+  startVoiceHeartbeat(interval) {
+    this.stopVoiceHeartbeat();
+    this.voiceHbInterval = setInterval(() => {
+      if (this.voiceWs && this.voiceWs.readyState === WebSocket.OPEN) {
+        this.voiceWs.send(JSON.stringify({ op: 3, d: Date.now() }));
+      }
+    }, interval);
+  }
+
+  stopVoiceHeartbeat() {
+    if (this.voiceHbInterval) clearInterval(this.voiceHbInterval);
+  }
+
+  performUdpDiscovery() {
+    return new Promise((resolve) => {
+      this.udpSock = dgram.createSocket('udp4');
+
+      const packet = Buffer.alloc(74);
+      packet.writeUInt32BE(this.ssrc, 0);
+
+      this.udpSock.on('message', (msg) => {
+        try {
+          const ipEnd = msg.indexOf(0, 8);
+          const ourIp = msg.toString('utf8', 8, ipEnd);
+          const ourPort = msg.readUInt16BE(6);
+
+          if (this.voiceWs && this.voiceWs.readyState === WebSocket.OPEN) {
+            this.voiceWs.send(JSON.stringify({
+              op: 1,
+              d: { protocol: 'udp', data: { address: ourIp, port: ourPort, mode: this.encryptionMode } }
+            }));
+          }
+          resolve(true);
+        } catch (err) {
+          console.error('[ERROR] Parsing UDP response:', err);
+          resolve(false);
+        }
+      });
+
+      this.udpSock.send(packet, 0, packet.length, this.voicePort, this.voiceIp, (err) => {
+        if (err) {
+          console.error('[ERROR] UDP Send failed:', err);
+          resolve(false);
+        }
+      });
+    });
+  }
+
+  encryptFrame(opusFrame) {
+    const hdr = Buffer.alloc(12);
+    hdr[0] = 0x80;
+    hdr[1] = 0x78;
+    hdr.writeUInt16BE(this.seq, 2);
+    hdr.writeUInt32BE(this.timestamp, 4);
+    hdr.writeUInt32BE(this.ssrc, 8);
+
+    const nonce = new Uint8Array(24);
+    nonce.set(hdr, 0);
+
+    const encrypted = nacl.secretbox(opusFrame, nonce, this.encryptionKey);
+    return Buffer.concat([hdr, Buffer.from(encrypted)]);
+  }
+
+  startSilenceLoop() {
+    this.stopSilenceLoop();
+    let count = 0;
+
+    this.silenceInterval = setInterval(() => {
+      if (!this.running || !this.connected || !this.udpSock) {
+        this.stopSilenceLoop();
         return;
+      }
+
+      try {
+        const pkt = this.encryptFrame(SILENCE_FRAME);
+        this.udpSock.send(pkt, 0, pkt.length, this.voicePort, this.voiceIp);
+
+        this.seq = (this.seq + 1) % 65536;
+        this.timestamp = (this.timestamp + FRAME_SIZE_AUDIO) % 4294967296;
+        count++;
+
+        if (count % 60 === 0) {
+          console.log(`[INFO] Alive - ${count} frames sent`);
+        }
+      } catch (e) {
+        console.error('[ERROR] Silence loop error:', e.message);
+        this.connected = false;
+        this.stopSilenceLoop();
+      }
+    }, SILENCE_INTERVAL);
+  }
+
+  stopSilenceLoop() {
+    if (this.silenceInterval) clearInterval(this.silenceInterval);
+  }
+
+  async cleanupVoice() {
+    this.stopSilenceLoop();
+    this.stopVoiceHeartbeat();
+    if (this.voiceWs) {
+      try { this.voiceWs.close(); } catch (e) {}
+      this.voiceWs = null;
     }
-    reconnectTimer = setTimeout(() => joinVoice(), delay);
+    if (this.udpSock) {
+      try { this.udpSock.close(); } catch (e) {}
+      this.udpSock = null;
+    }
+  }
+
+  sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
 }
 
-client.on('ready', async () => {
-    console.log(`[VOICE] Logged in as: ${client.user.tag}`);
-    await joinVoice();
-});
-
-client.on('voiceStateUpdate', (oldState, newState) => {
-    if (newState.id !== client.user?.id) return;
-    if (!newState.channelId) {
-        voiceConnection = null;
-        scheduleReconnect();
-    }
-});
-
-// --- HTTP SERVER & KEEP-ALIVE PING SYSTEM ---
-const server = http.createServer((req, res) => {
-    if (req.url === '/health' || req.url === '/ping') {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ 
-            status: 'online', 
-            voiceReady: Boolean(voiceConnection?.ready),
-            timestamp: new Date().toISOString()
-        }));
-    } else {
-        res.writeHead(200, { 'Content-Type': 'text/plain' });
-        res.end('Host Keep-Alive Service is Running!');
-    }
-});
-
-server.listen(PORT, () => console.log(`[HTTP] Anti-Sleep Server listening on port ${PORT}`));
-
-// Hàm tự gửi HTTP request đến chính URL để không bị ngủ
-function startKeepAlivePing() {
-    if (!APP_URL) {
-        console.log('[PING] APP_URL chưa được cấu hình. Bỏ qua tự động ping.');
-        return;
-    }
-
-    const fullUrl = APP_URL.startsWith('http') ? APP_URL : `https://${APP_URL}`;
-    const pingEndpoint = `${fullUrl.replace(/\/+$/, '')}/ping`;
-
-    console.log(`[PING] Khởi chạy Keep-Alive Ping tới: ${pingEndpoint}`);
-
-    // Gửi Ping mỗi 10 phút (600,000 ms)
-    setInterval(() => {
-        const requester = pingEndpoint.startsWith('https') ? https : http;
-        requester.get(pingEndpoint, (res) => {
-            console.log(`[PING] Keep-Alive Ping Sent | Status: ${res.statusCode}`);
-        }).on('error', (err) => {
-            console.error(`[PING] Ping Error: ${err.message}`);
-        });
-    }, 10 * 60 * 1000);
-}
-
-startKeepAlivePing();
-
-client.login(TOKEN).catch(() => process.exit(1));
+const client = new VoiceClient();
+client.run().catch((err) => console.error('[FATAL]', err));
