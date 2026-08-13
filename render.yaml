@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: index.js
+    env: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: GUILD_ID
+        sync: false
+      - key: CHANNEL_ID
+        sync: false
+      - key: PORT
+        value: "8080"
