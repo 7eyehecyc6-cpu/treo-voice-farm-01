@@ -5,7 +5,7 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm ci --only=production
 
-COPY voice_farm.js .
+COPY index.js .
 
 EXPOSE 8080
 
